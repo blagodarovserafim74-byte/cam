@@ -1,0 +1,5 @@
+from ip_camera_viewer.app import run
+
+
+if __name__ == "__main__":
+    run()
