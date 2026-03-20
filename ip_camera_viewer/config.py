@@ -4,21 +4,24 @@ from dataclasses import dataclass, field
 @dataclass(frozen=True)
 class UIConfig:
     window_title: str = "IP Camera Viewer"
-    window_size: str = "1100x720"
-    min_width: int = 900
-    min_height: int = 620
+    window_size: str = "1180x760"
+    min_width: int = 980
+    min_height: int = 680
     queue_poll_ms: int = 30
     video_area_min_width: int = 720
-    video_area_min_height: int = 480
+    video_area_min_height: int = 520
 
 
 @dataclass(frozen=True)
 class StreamConfig:
-    warmup_attempts: int = 30
-    warmup_delay_sec: float = 0.10
-    max_failed_reads: int = 20
-    read_retry_delay_sec: float = 0.05
-    loop_sleep_sec: float = 0.01
+    probe_timeout_sec: float = 8.0
+    read_chunk_timeout_sec: float = 10.0
+
+
+@dataclass(frozen=True)
+class DiscoveryConfig:
+    probe_timeout_sec: float = 5.0
+    progress_delay_sec: float = 0.05
 
 
 @dataclass(frozen=True)
@@ -30,6 +33,7 @@ class ValidationConfig:
 class AppConfig:
     ui: UIConfig = field(default_factory=UIConfig)
     stream: StreamConfig = field(default_factory=StreamConfig)
+    discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
 
 

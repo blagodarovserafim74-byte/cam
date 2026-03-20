@@ -1,10 +1,8 @@
-import cv2
 from PIL import Image
 
 
 def frame_to_canvas(frame, max_width: int, max_height: int) -> Image.Image:
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    image = Image.fromarray(rgb_frame)
+    image = Image.fromarray(frame)
     image.thumbnail((max_width, max_height), Image.LANCZOS)
 
     canvas = Image.new("RGB", (max_width, max_height), "black")

@@ -1,16 +1,17 @@
 import queue
+import subprocess
 import threading
-import time
 from typing import Optional
 
-import cv2
+import numpy as np
 
 from ip_camera_viewer.config import StreamConfig
 from ip_camera_viewer.models import StreamEventType, StreamMessage
+from ip_camera_viewer.utils.ffmpeg import build_ffmpeg_command, probe_stream_info
 
 
 class CameraStreamWorker(threading.Thread):
-    """Фоновый поток чтения видео с IP-камеры."""
+    """Фоновый поток чтения видео через FFmpeg."""
 
     def __init__(self, url: str, output_queue: "queue.Queue[StreamMessage]", stream_config: StreamConfig) -> None:
         super().__init__(daemon=True)
@@ -18,112 +19,126 @@ class CameraStreamWorker(threading.Thread):
         self.output_queue = output_queue
         self.stream_config = stream_config
         self.stop_event = threading.Event()
-        self.capture: Optional[cv2.VideoCapture] = None
+        self.process: Optional[subprocess.Popen[bytes]] = None
 
     def run(self) -> None:
-        # Сообщаем интерфейсу, что началась попытка подключения.
-        self._send(StreamEventType.CONNECTING, text="Подключение к камере...")
+        self._send(StreamEventType.CONNECTING, text="Подключение к камере через FFmpeg...")
 
-        capture = self._open_capture()
-        if capture is None:
+        stream_info, error_text = probe_stream_info(
+            url=self.url,
+            timeout_sec=self.stream_config.probe_timeout_sec,
+        )
+        if stream_info is None:
             self._send(
                 StreamEventType.ERROR,
                 text=(
-                    "Не удалось открыть видеопоток. Проверьте ссылку, логин, пароль, "
-                    "порт и доступность камеры."
+                    "Не удалось получить параметры потока через FFmpeg/ffprobe. "
+                    f"{error_text}"
                 ),
             )
             return
 
-        self.capture = capture
+        try:
+            command = build_ffmpeg_command(
+                url=self.url,
+                width=stream_info.width,
+                height=stream_info.height,
+            )
+        except FileNotFoundError as exc:
+            self._send(StreamEventType.ERROR, text=str(exc))
+            return
+
+        frame_size = stream_info.width * stream_info.height * 3
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
         try:
-            # Сначала ждём первый реальный кадр, чтобы убедиться, что поток живой.
-            if not self._wait_for_first_frame():
-                self._send(
-                    StreamEventType.ERROR,
-                    text=(
-                        "Соединение установлено, но камера не отдаёт кадры. "
-                        "Проверьте правильность URL потока."
-                    ),
-                )
-                return
+            self.process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                bufsize=10**8,
+                creationflags=creationflags,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._send(StreamEventType.ERROR, text=f"Не удалось запустить FFmpeg: {exc}")
+            return
 
-            failed_reads = 0
+        first_frame_sent = False
 
+        try:
             while not self.stop_event.is_set():
-                ok, frame = self.capture.read()
+                if self.process.stdout is None:
+                    self._send(StreamEventType.ERROR, text="FFmpeg не открыл канал чтения кадров.")
+                    return
 
-                if not ok or frame is None:
-                    failed_reads += 1
-                    if failed_reads >= self.stream_config.max_failed_reads:
-                        self._send(
-                            StreamEventType.ERROR,
-                            text="Поток прерван или камера перестала отвечать.",
-                        )
-                        return
+                raw_frame = self.process.stdout.read(frame_size)
 
-                    time.sleep(self.stream_config.read_retry_delay_sec)
-                    continue
+                if len(raw_frame) != frame_size:
+                    error_text = self._collect_process_error()
+                    if self.stop_event.is_set():
+                        break
 
-                failed_reads = 0
+                    self._send(
+                        StreamEventType.ERROR,
+                        text=(
+                            "FFmpeg прекратил отдавать кадры. "
+                            f"{error_text}"
+                        ).strip(),
+                    )
+                    return
+
+                frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape(
+                    (stream_info.height, stream_info.width, 3)
+                ).copy()
+
+                if not first_frame_sent:
+                    self._send(StreamEventType.CONNECTED, text="Камера подключена через FFmpeg.")
+                    first_frame_sent = True
+
                 self._send(StreamEventType.FRAME, frame=frame)
-                time.sleep(self.stream_config.loop_sleep_sec)
 
         except Exception as exc:  # noqa: BLE001
-            self._send(StreamEventType.ERROR, text=f"Ошибка во время чтения потока: {exc}")
+            if not self.stop_event.is_set():
+                self._send(StreamEventType.ERROR, text=f"Ошибка во время чтения потока FFmpeg: {exc}")
         finally:
-            self._release_capture()
+            self._terminate_process()
             self._send(StreamEventType.DISCONNECTED, text="Поток остановлен.")
 
     def stop(self) -> None:
         self.stop_event.set()
-        self._release_capture()
+        self._terminate_process()
 
-    def _open_capture(self) -> Optional[cv2.VideoCapture]:
-        # Сначала пробуем FFMPEG, затем обычное открытие как запасной вариант.
-        backend = getattr(cv2, "CAP_FFMPEG", 0)
-        capture = cv2.VideoCapture(self.url, backend)
+    def _terminate_process(self) -> None:
+        if self.process is None:
+            return
 
-        if capture.isOpened():
-            return capture
+        try:
+            if self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=1.5)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=1.5)
+        except Exception:
+            pass
+        finally:
+            self.process = None
 
-        capture.release()
-        fallback_capture = cv2.VideoCapture(self.url)
-        if fallback_capture.isOpened():
-            return fallback_capture
+    def _collect_process_error(self) -> str:
+        if self.process is None or self.process.stderr is None:
+            return ""
 
-        fallback_capture.release()
-        return None
-
-    def _wait_for_first_frame(self) -> bool:
-        for _ in range(self.stream_config.warmup_attempts):
-            if self.stop_event.is_set():
-                return False
-
-            ok, frame = self.capture.read()
-            if ok and frame is not None:
-                self._send(StreamEventType.CONNECTED, text="Камера подключена.")
-                self._send(StreamEventType.FRAME, frame=frame)
-                return True
-
-            time.sleep(self.stream_config.warmup_delay_sec)
-
-        return False
-
-    def _release_capture(self) -> None:
-        if self.capture is not None:
-            try:
-                self.capture.release()
-            except Exception:
-                pass
-            finally:
-                self.capture = None
+        try:
+            stderr_data = self.process.stderr.read().decode("utf-8", errors="ignore").strip()
+            return stderr_data
+        except Exception:
+            return ""
 
     def _send(self, event: StreamEventType, frame=None, text: str = "") -> None:
         message = StreamMessage(event=event, frame=frame, text=text)
 
-        # Для видео держим очередь маленькой, чтобы не копить старые кадры.
         if event == StreamEventType.FRAME and self.output_queue.full():
             try:
                 self.output_queue.get_nowait()

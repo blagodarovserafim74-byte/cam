@@ -17,3 +17,14 @@ def validate_camera_url(url: str) -> tuple[bool, str]:
         return False, "Ссылка выглядит неполной. Проверьте адрес камеры, порт и логин."
 
     return True, ""
+
+
+def validate_discovery_host(host: str) -> tuple[bool, str]:
+    value = host.strip()
+    if not value:
+        return False, "Введите IP, доменное имя или базовый адрес камеры."
+
+    if " " in value:
+        return False, "Адрес камеры не должен содержать пробелы."
+
+    return True, ""
