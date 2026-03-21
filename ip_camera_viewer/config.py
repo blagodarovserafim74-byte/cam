@@ -15,7 +15,6 @@ class UIConfig:
 @dataclass(frozen=True)
 class StreamConfig:
     probe_timeout_sec: float = 8.0
-    read_chunk_timeout_sec: float = 10.0
 
 
 @dataclass(frozen=True)
@@ -30,11 +29,23 @@ class ValidationConfig:
 
 
 @dataclass(frozen=True)
+class PersonDetectionConfig:
+    enabled_by_default: bool = False
+    model_name: str = "yolo11m.pt"
+    inference_size: int = 640
+    confidence: float = 0.35
+    detection_max_width: int = 960
+    detect_every_n_frames: int = 3
+    max_pending_frames: int = 1
+
+
+@dataclass(frozen=True)
 class AppConfig:
     ui: UIConfig = field(default_factory=UIConfig)
     stream: StreamConfig = field(default_factory=StreamConfig)
     discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
+    person_detection: PersonDetectionConfig = field(default_factory=PersonDetectionConfig)
 
 
 APP_CONFIG = AppConfig()

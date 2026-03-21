@@ -1,17 +1,22 @@
 import queue
 import subprocess
 import threading
+from io import BytesIO
 from typing import Optional
 
 import numpy as np
+from PIL import Image
 
 from ip_camera_viewer.config import StreamConfig
 from ip_camera_viewer.models import StreamEventType, StreamMessage
-from ip_camera_viewer.utils.ffmpeg import build_ffmpeg_command, probe_stream_info
+from ip_camera_viewer.utils.ffmpeg import (
+    build_ffmpeg_mjpeg_pipe_command,
+    probe_stream_available,
+)
 
 
 class CameraStreamWorker(threading.Thread):
-    """Фоновый поток чтения видео через FFmpeg."""
+    """Фоновый поток чтения видео через FFmpeg image2pipe."""
 
     def __init__(self, url: str, output_queue: "queue.Queue[StreamMessage]", stream_config: StreamConfig) -> None:
         super().__init__(daemon=True)
@@ -24,31 +29,23 @@ class CameraStreamWorker(threading.Thread):
     def run(self) -> None:
         self._send(StreamEventType.CONNECTING, text="Подключение к камере через FFmpeg...")
 
-        stream_info, error_text = probe_stream_info(
+        ok, error_text = probe_stream_available(
             url=self.url,
             timeout_sec=self.stream_config.probe_timeout_sec,
         )
-        if stream_info is None:
+        if not ok:
             self._send(
                 StreamEventType.ERROR,
-                text=(
-                    "Не удалось получить параметры потока через FFmpeg/ffprobe. "
-                    f"{error_text}"
-                ),
+                text=f"Не удалось получить первый кадр через FFmpeg. {error_text}".strip(),
             )
             return
 
         try:
-            command = build_ffmpeg_command(
-                url=self.url,
-                width=stream_info.width,
-                height=stream_info.height,
-            )
+            command = build_ffmpeg_mjpeg_pipe_command(self.url)
         except FileNotFoundError as exc:
             self._send(StreamEventType.ERROR, text=str(exc))
             return
 
-        frame_size = stream_info.width * stream_info.height * 3
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
         try:
@@ -57,13 +54,14 @@ class CameraStreamWorker(threading.Thread):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 stdin=subprocess.DEVNULL,
-                bufsize=10**8,
+                bufsize=0,
                 creationflags=creationflags,
             )
         except Exception as exc:  # noqa: BLE001
             self._send(StreamEventType.ERROR, text=f"Не удалось запустить FFmpeg: {exc}")
             return
 
+        buffer = bytearray()
         first_frame_sent = False
 
         try:
@@ -72,31 +70,46 @@ class CameraStreamWorker(threading.Thread):
                     self._send(StreamEventType.ERROR, text="FFmpeg не открыл канал чтения кадров.")
                     return
 
-                raw_frame = self.process.stdout.read(frame_size)
+                chunk = self.process.stdout.read(4096)
 
-                if len(raw_frame) != frame_size:
-                    error_text = self._collect_process_error()
+                if not chunk:
                     if self.stop_event.is_set():
                         break
 
+                    error_text = self._collect_process_error()
                     self._send(
                         StreamEventType.ERROR,
-                        text=(
-                            "FFmpeg прекратил отдавать кадры. "
-                            f"{error_text}"
-                        ).strip(),
+                        text=(f"FFmpeg прекратил отдавать кадры. {error_text}").strip(),
                     )
                     return
 
-                frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape(
-                    (stream_info.height, stream_info.width, 3)
-                ).copy()
+                buffer.extend(chunk)
 
-                if not first_frame_sent:
-                    self._send(StreamEventType.CONNECTED, text="Камера подключена через FFmpeg.")
-                    first_frame_sent = True
+                while True:
+                    start = buffer.find(b"\xff\xd8")
+                    if start == -1:
+                        if len(buffer) > 2_000_000:
+                            buffer.clear()
+                        break
 
-                self._send(StreamEventType.FRAME, frame=frame)
+                    end = buffer.find(b"\xff\xd9", start + 2)
+                    if end == -1:
+                        if start > 0:
+                            del buffer[:start]
+                        break
+
+                    jpeg_bytes = bytes(buffer[start:end + 2])
+                    del buffer[:end + 2]
+
+                    frame = self._decode_jpeg_frame(jpeg_bytes)
+                    if frame is None:
+                        continue
+
+                    if not first_frame_sent:
+                        self._send(StreamEventType.CONNECTED, text="Камера подключена через FFmpeg.")
+                        first_frame_sent = True
+
+                    self._send(StreamEventType.FRAME, frame=frame)
 
         except Exception as exc:  # noqa: BLE001
             if not self.stop_event.is_set():
@@ -108,6 +121,14 @@ class CameraStreamWorker(threading.Thread):
     def stop(self) -> None:
         self.stop_event.set()
         self._terminate_process()
+
+    def _decode_jpeg_frame(self, jpeg_bytes: bytes):
+        try:
+            with Image.open(BytesIO(jpeg_bytes)) as image:
+                rgb_image = image.convert("RGB")
+                return np.array(rgb_image)
+        except Exception:
+            return None
 
     def _terminate_process(self) -> None:
         if self.process is None:

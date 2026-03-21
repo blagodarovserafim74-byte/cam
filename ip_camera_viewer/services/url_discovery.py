@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 
 from ip_camera_viewer.config import DiscoveryConfig
 from ip_camera_viewer.models import StreamEventType, StreamMessage
-from ip_camera_viewer.utils.ffmpeg import probe_stream_info
+from ip_camera_viewer.utils.ffmpeg import probe_stream_available
 
 
 @dataclass(frozen=True)
@@ -74,8 +74,8 @@ class URLDiscoveryWorker(threading.Thread):
         self.stop_event.set()
 
     def _probe_candidate(self, url: str) -> bool:
-        stream_info, _ = probe_stream_info(url=url, timeout_sec=self.config.probe_timeout_sec)
-        return stream_info is not None
+        ok, _ = probe_stream_available(url=url, timeout_sec=self.config.probe_timeout_sec)
+        return ok
 
     @staticmethod
     def _build_candidates(host_input: str, username: str, password: str) -> list[str]:
@@ -97,6 +97,7 @@ class URLDiscoveryWorker(threading.Thread):
             f"rtsp://{credentials}{normalized_host}:554/stream",
             f"rtsp://{credentials}{normalized_host}:554/live/ch00_0",
             f"rtsp://{credentials}{normalized_host}:554/Streaming/Channels/101",
+            f"rtsp://{credentials}{normalized_host}:554/Streaming/Channels/102",
             f"rtsp://{credentials}{normalized_host}:554/h264Preview_01_main",
             f"rtsp://{credentials}{normalized_host}:554/cam/realmonitor?channel=1&subtype=0",
         ]

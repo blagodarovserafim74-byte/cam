@@ -3,11 +3,13 @@ import tkinter as tk
 from tkinter import messagebox
 from typing import Optional
 
+import cv2
 from PIL import ImageTk
 
 from ip_camera_viewer.config import APP_CONFIG
 from ip_camera_viewer.models import StreamEventType, StreamMessage
 from ip_camera_viewer.services.camera_stream import CameraStreamWorker
+from ip_camera_viewer.services.person_detector import PersonDetectorService
 from ip_camera_viewer.services.url_discovery import DiscoveryRequest, URLDiscoveryWorker
 from ip_camera_viewer.utils.image import frame_to_canvas
 from ip_camera_viewer.utils.validators import validate_camera_url, validate_discovery_host
@@ -26,11 +28,20 @@ class MainWindow:
         self.discovery_password_var = tk.StringVar()
         self.discovery_result_var = tk.StringVar(value="Найденная ссылка появится здесь.")
         self.status_var = tk.StringVar(value="Статус: не подключено")
+        self.person_status_var = tk.StringVar(value="Человек: ожидание видео")
+        self.model_status_var = tk.StringVar(value="YOLO: не запущен")
+        self.person_detection_enabled_var = tk.BooleanVar(
+            value=APP_CONFIG.person_detection.enabled_by_default
+        )
+
         self.message_queue: "queue.Queue[StreamMessage]" = queue.Queue(maxsize=20)
 
         self.stream_worker: Optional[CameraStreamWorker] = None
         self.discovery_worker: Optional[URLDiscoveryWorker] = None
         self.current_photo: Optional[ImageTk.PhotoImage] = None
+        self.frame_counter = 0
+
+        self.person_detector = PersonDetectorService(APP_CONFIG.person_detection)
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -67,13 +78,20 @@ class MainWindow:
         )
         self.disconnect_button.grid(row=0, column=3)
 
+        tk.Checkbutton(
+            connection_frame,
+            text="Определять человека (YOLO11m)",
+            variable=self.person_detection_enabled_var,
+            command=self._on_person_detection_toggle,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
         examples = (
             "Примеры ссылок:\n"
             "rtsp://login:password@192.168.1.10:554/stream\n"
             "http://192.168.1.10:8080/video"
         )
         tk.Label(connection_frame, text=examples, justify="left", fg="#333333").grid(
-            row=1, column=0, columnspan=4, sticky="w", pady=(8, 0)
+            row=2, column=0, columnspan=4, sticky="w", pady=(8, 0)
         )
 
         discovery_frame = tk.LabelFrame(root_frame, text="Поиск ссылки прямо в программе", padx=10, pady=10)
@@ -111,7 +129,7 @@ class MainWindow:
             discovery_frame,
             text=(
                 "Укажи IP/адрес своей камеры, а программа проверит типовые RTSP/HTTP-ссылки "
-                "для этого хоста через FFmpeg/ffprobe. Сканирование всей сети не используется."
+                "для этого хоста через FFmpeg. Сканирование всей сети не используется."
             ),
             justify="left",
             fg="#333333",
@@ -133,7 +151,25 @@ class MainWindow:
             fg="red",
             font=("Segoe UI", 10, "bold"),
         )
-        self.status_label.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        self.status_label.grid(row=3, column=0, sticky="ew", pady=(0, 4))
+
+        self.person_status_label = tk.Label(
+            root_frame,
+            textvariable=self.person_status_var,
+            anchor="w",
+            fg="#0b5ed7",
+            font=("Segoe UI", 10, "bold"),
+        )
+        self.person_status_label.grid(row=4, column=0, sticky="ew", pady=(0, 4))
+
+        self.model_status_label = tk.Label(
+            root_frame,
+            textvariable=self.model_status_var,
+            anchor="w",
+            fg="#555555",
+            font=("Segoe UI", 9),
+        )
+        self.model_status_label.grid(row=5, column=0, sticky="ew", pady=(0, 10))
 
         video_frame = tk.LabelFrame(root_frame, text="Видео", padx=10, pady=10)
         video_frame.grid(row=2, column=0, sticky="nsew")
@@ -149,6 +185,8 @@ class MainWindow:
         )
         self.video_label.grid(row=0, column=0, sticky="nsew")
 
+        self._on_person_detection_toggle()
+
     def connect_camera(self) -> None:
         url = self.url_var.get().strip()
         is_valid, error_text = validate_camera_url(url)
@@ -159,6 +197,11 @@ class MainWindow:
             return
 
         self.disconnect_camera(show_status=False)
+        self.frame_counter = 0
+
+        if self.person_detection_enabled_var.get():
+            self.person_detector.start()
+            self.model_status_var.set(self.person_detector.get_status_text())
 
         self.stream_worker = CameraStreamWorker(
             url=url,
@@ -170,6 +213,7 @@ class MainWindow:
         self.connect_button.config(state="disabled")
         self.disconnect_button.config(state="normal")
         self._set_status("Статус: подключение...", "orange")
+        self.person_status_var.set("Человек: ожидание видео")
 
     def disconnect_camera(self, show_status: bool = True) -> None:
         if self.stream_worker is not None:
@@ -184,6 +228,11 @@ class MainWindow:
 
         if show_status:
             self._set_status("Статус: отключено", "red")
+
+        if self.person_detection_enabled_var.get():
+            self.person_status_var.set("Человек: ожидание видео")
+        else:
+            self.person_status_var.set("Человек: проверка выключена")
 
     def find_camera_url(self) -> None:
         host = self.discovery_host_var.get().strip()
@@ -274,9 +323,48 @@ class MainWindow:
         max_width = max(self.video_label.winfo_width(), APP_CONFIG.ui.video_area_min_width)
         max_height = max(self.video_label.winfo_height(), APP_CONFIG.ui.video_area_min_height)
 
-        canvas = frame_to_canvas(message.frame, max_width=max_width, max_height=max_height)
+        frame = message.frame
+
+        if self.person_detection_enabled_var.get():
+            self.frame_counter += 1
+            if self.frame_counter % max(APP_CONFIG.person_detection.detect_every_n_frames, 1) == 0:
+                self.person_detector.submit_frame(frame)
+
+            frame = self._draw_person_boxes(frame)
+
+            snapshot = self.person_detector.get_snapshot()
+            self.model_status_var.set(self.person_detector.get_status_text())
+            if snapshot.person_count > 0:
+                self.person_status_var.set(f"Человек: обнаружен ({snapshot.person_count})")
+            else:
+                self.person_status_var.set("Человек: не обнаружен")
+        else:
+            self.person_status_var.set("Человек: проверка выключена")
+            self.model_status_var.set("YOLO: не используется")
+
+        canvas = frame_to_canvas(frame, max_width=max_width, max_height=max_height)
         self.current_photo = ImageTk.PhotoImage(canvas)
         self.video_label.config(image=self.current_photo, text="")
+
+    def _draw_person_boxes(self, frame):
+        snapshot = self.person_detector.get_snapshot()
+        if snapshot.person_count == 0:
+            return frame
+
+        annotated = frame.copy()
+        for box in snapshot.boxes:
+            cv2.rectangle(annotated, (box.x1, box.y1), (box.x2, box.y2), (0, 255, 0), 2)
+            cv2.putText(
+                annotated,
+                f"Person {box.confidence:.2f}",
+                (box.x1, max(box.y1 - 8, 20)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
+        return annotated
 
     def _show_placeholder(self, text: str) -> None:
         self.current_photo = None
@@ -285,6 +373,15 @@ class MainWindow:
     def _set_status(self, text: str, color: str) -> None:
         self.status_var.set(text)
         self.status_label.config(fg=color)
+
+    def _on_person_detection_toggle(self) -> None:
+        if self.person_detection_enabled_var.get():
+            self.person_detector.start()
+            self.person_status_var.set("Человек: ожидание видео")
+            self.model_status_var.set(self.person_detector.get_status_text())
+        else:
+            self.person_status_var.set("Человек: проверка выключена")
+            self.model_status_var.set("YOLO: не используется")
 
     def _clear_queue_frames(self) -> None:
         items: list[StreamMessage] = []
@@ -305,4 +402,5 @@ class MainWindow:
     def on_close(self) -> None:
         self.stop_discovery()
         self.disconnect_camera(show_status=False)
+        self.person_detector.stop()
         self.root.destroy()
